@@ -20,6 +20,7 @@ import android.content.ContentValues;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 
+import com.activeandroid.annotation.Column;
 import com.activeandroid.content.ContentProvider;
 import com.activeandroid.query.Delete;
 import com.activeandroid.query.Select;
@@ -28,50 +29,52 @@ import com.activeandroid.util.Log;
 import com.activeandroid.util.ReflectionUtils;
 
 import java.lang.reflect.Field;
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
 @SuppressWarnings("unchecked")
 public abstract class Model {
-
-	/** Prime number used for hashcode() implementation. */
-	private static final int HASH_PRIME = 739;
-
 	//////////////////////////////////////////////////////////////////////////////////////
 	// PRIVATE MEMBERS
 	//////////////////////////////////////////////////////////////////////////////////////
 
-	private Long mId = null;
+	@Column(name = "Id")
+	public Long id = null;
 
-	private final TableInfo mTableInfo;
-	private final String idName;
+    // This is the ID, that is currently stored in the database. By keeping the id redundant,
+    // it is possible to change the Id of an entity.
+    private Long mPersistedId = null;
+
+	private TableInfo mTableInfo;
+
 	//////////////////////////////////////////////////////////////////////////////////////
 	// CONSTRUCTORS
 	//////////////////////////////////////////////////////////////////////////////////////
 
 	public Model() {
 		mTableInfo = Cache.getTableInfo(getClass());
-		idName = mTableInfo.getIdName();
 	}
 
 	//////////////////////////////////////////////////////////////////////////////////////
 	// PUBLIC METHODS
 	//////////////////////////////////////////////////////////////////////////////////////
 
-	public final Long getId() {
-		return mId;
-	}
+    public final Long getId() {
+        return id;
+    }
+
+    public final Long getPersistedId() {
+        return mPersistedId;
+    }
 
 	public final void delete() {
-		Cache.openDatabase().delete(mTableInfo.getTableName(), idName+"=?", new String[] { getId().toString() });
+		Cache.openDatabase().delete(mTableInfo.getTableName(), "Id=?", new String[]{mPersistedId.toString()});
 		Cache.removeEntity(this);
 
 		Cache.getContext().getContentResolver()
-				.notifyChange(ContentProvider.createUri(mTableInfo.getType(), mId), null);
+				.notifyChange(ContentProvider.createUri(mTableInfo.getType(), mPersistedId), null);
 	}
 
-	public final Long save() {
+	public final void save() {
 		final SQLiteDatabase db = Cache.openDatabase();
 		final ContentValues values = new ContentValues();
 
@@ -137,7 +140,7 @@ public abstract class Model {
 					values.put(fieldName, (byte[]) value);
 				}
 				else if (ReflectionUtils.isModel(fieldType)) {
-					values.put(fieldName, ((Model) value).getId());
+					values.put(fieldName, ((Model) value).mPersistedId);
 				}
 				else if (ReflectionUtils.isSubclassOf(fieldType, Enum.class)) {
 					values.put(fieldName, ((Enum<?>) value).name());
@@ -151,42 +154,40 @@ public abstract class Model {
 			}
 		}
 
-		if (mId == null) {
-			mId = db.insert(mTableInfo.getTableName(), null, values);
+		if (mPersistedId == null) {
+            mPersistedId = db.insert(mTableInfo.getTableName(), null, values);
+            id = mPersistedId;
 		}
 		else {
-			db.update(mTableInfo.getTableName(), values, idName+"=" + mId, null);
+			db.update(mTableInfo.getTableName(), values, "Id=" + mPersistedId, null);
+
+            // The Id may has been updated, so we need to update mPersistedId and the Cache, as
+            // it stores Entities with their corresponding Ids.
+            Cache.updateEntityId(this, mPersistedId);
+            mPersistedId = id;
 		}
 
 		Cache.getContext().getContentResolver()
-				.notifyChange(ContentProvider.createUri(mTableInfo.getType(), mId), null);
-		return mId;
+				.notifyChange(ContentProvider.createUri(mTableInfo.getType(), mPersistedId), null);
 	}
 
 	// Convenience methods
 
 	public static void delete(Class<? extends Model> type, long id) {
-		TableInfo tableInfo = Cache.getTableInfo(type);
-		new Delete().from(type).where(tableInfo.getIdName()+"=?", id).execute();
+		new Delete().from(type).where("Id=?", id).execute();
 	}
 
 	public static <T extends Model> T load(Class<T> type, long id) {
-		TableInfo tableInfo = Cache.getTableInfo(type);
-		return (T) new Select().from(type).where(tableInfo.getIdName()+"=?", id).executeSingle();
+		return (T) new Select().from(type).where("Id=?", id).executeSingle();
 	}
 
 	// Model population
 
 	public final void loadFromCursor(Cursor cursor) {
-        /**
-         * Obtain the columns ordered to fix issue #106 (https://github.com/pardom/ActiveAndroid/issues/106)
-         * when the cursor have multiple columns with same name obtained from join tables.
-         */
-        List<String> columnsOrdered = new ArrayList<String>(Arrays.asList(cursor.getColumnNames()));
 		for (Field field : mTableInfo.getFields()) {
 			final String fieldName = mTableInfo.getColumnName(field);
 			Class<?> fieldType = field.getType();
-			final int columnIndex = columnsOrdered.indexOf(fieldName);
+			final int columnIndex = cursor.getColumnIndex(fieldName);
 
 			if (columnIndex < 0) {
 				continue;
@@ -244,7 +245,7 @@ public abstract class Model {
 
 					Model entity = Cache.getEntity(entityType, entityId);
 					if (entity == null) {
-						entity = new Select().from(entityType).where(idName+"=?", entityId).executeSingle();
+						entity = new Select().from(entityType).where("Id=?", entityId).executeSingle();
 					}
 
 					value = entity;
@@ -276,7 +277,8 @@ public abstract class Model {
 			}
 		}
 
-		if (mId != null) {
+		if (id != null) {
+            mPersistedId = id;
 			Cache.addEntity(this);
 		}
 	}
@@ -286,7 +288,7 @@ public abstract class Model {
 	//////////////////////////////////////////////////////////////////////////////////////
 
 	protected final <T extends Model> List<T> getMany(Class<T> type, String foreignKey) {
-		return new Select().from(type).where(Cache.getTableName(type) + "." + foreignKey + "=?", getId()).execute();
+		return new Select().from(type).where(Cache.getTableName(type) + "." + foreignKey + "=?", mPersistedId).execute();
 	}
 
 	//////////////////////////////////////////////////////////////////////////////////////
@@ -295,26 +297,14 @@ public abstract class Model {
 
 	@Override
 	public String toString() {
-		return mTableInfo.getTableName() + "@" + getId();
+		return mTableInfo.getTableName() + "@" + id;
 	}
 
 	@Override
 	public boolean equals(Object obj) {
-		if (obj instanceof Model && this.mId != null) {
-			final Model other = (Model) obj;
+		final Model other = (Model) obj;
 
-			return this.mId.equals(other.mId)							
-							&& (this.mTableInfo.getTableName().equals(other.mTableInfo.getTableName()));
-		} else {
-			return this == obj;
-		}
-	}
-
-	@Override
-	public int hashCode() {
-		int hash = HASH_PRIME;
-		hash += HASH_PRIME * (mId == null ? super.hashCode() : mId.hashCode()); //if id is null, use Object.hashCode()
-		hash += HASH_PRIME * mTableInfo.getTableName().hashCode();
-		return hash; //To change body of generated methods, choose Tools | Templates.
+		return id != null && (this.mTableInfo.getTableName().equals(other.mTableInfo.getTableName()))
+				&& (id.equals(other.id));
 	}
 }
